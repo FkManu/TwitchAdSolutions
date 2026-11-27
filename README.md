@@ -1,6 +1,6 @@
 # Free Adv Twitch Script
 
-An independently maintained continuation of VAFT, published here as a fork of the original GitHub repository. Development and issue reports are tracked in the [Free Adv Twitch Script repository](https://github.com/FkManu/free-adv-twitch-script).
+An independently maintained continuation of VAFT, published as a fork of the original GitHub repository. [Report a playback problem](https://github.com/FkManu/TwitchAdSolutions/issues)
 
 **37.0.5** is the current build. It tries to resume playback directly at the end of an ad and reloads the player if it needs to restore the original master playlist. [37.0.5 release notes](https://github.com/FkManu/TwitchAdSolutions/releases/tag/v37.0.5)
 
