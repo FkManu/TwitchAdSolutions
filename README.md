@@ -1,10 +1,21 @@
-Project archived on 2026-03-05. I'm no longer interested in Twitch. So much garbage content. Every time I go on the site it's worse.
-
 # TwitchAdSolutions
 
-This repo aims to provide multiple solutions for blocking Twitch ads.
+This community fork maintains VAFT. The [original project](https://github.com/pixeltris/TwitchAdSolutions) was archived on March 5, 2026. See [LICENSE](LICENSE) for the original MIT license and attribution.
 
 **Don't combine Twitch specific ad blockers.**
+
+## Install VAFT
+
+Choose a published release on the repository's **Releases** page. Copy the Raw link for the file you need at that release's commit. GitHub's **Raw** button opens the script itself. A branch link can change as commits are added.
+
+| Install with | File at the release commit | Where to use the Raw link |
+| --- | --- | --- |
+| uBlock Origin | `vaft/vaft-ublock-origin.js` | Set `userResourcesLocation` to the Raw URL and add `twitch.tv##+js(twitch-videoad)` in **My filters**. |
+| Tampermonkey | `vaft/vaft.user.js` | Open the Raw URL and confirm installation. Disable any local VAFT test script first. |
+
+To update or roll back, switch to the Raw link for the desired release. For uBlock Origin, replace the previous VAFT URL in `userResourcesLocation`, then restart the extension and reload Twitch. In the console, `hookWorkerFetch (vaft) build=…` identifies the version that reached the player.
+
+For reproduction steps and release checks, see [maintenance notes](vaft/MANUTENZIONE.md).
 
 ## Recommendations
 
@@ -29,7 +40,7 @@ Alternatively:
 
 **There are better / easier to use methods in the above recommendations.**
 
-- vaft - [userscript](https://github.com/pixeltris/TwitchAdSolutions/raw/master/vaft/vaft.user.js) / [ublock](https://raw.githubusercontent.com/pixeltris/TwitchAdSolutions/master/vaft/vaft-ublock-origin.js) / [ublock (permalink)](https://raw.githubusercontent.com/pixeltris/TwitchAdSolutions/f8f86706daf90daa534b26bce5b2f01238667d5f/vaft/vaft-ublock-origin.js)
+- vaft - [userscript source](vaft/vaft.user.js) / [uBlock Origin source](vaft/vaft-ublock-origin.js)
   - Attempts to get a clean stream as fast as it can
   - If it fails to get a clean stream it removes ad segments (no playback until ad-free stream is found)
 - video-swap-new - [userscript](https://github.com/pixeltris/TwitchAdSolutions/raw/master/video-swap-new/video-swap-new.user.js) / [ublock](https://raw.githubusercontent.com/pixeltris/TwitchAdSolutions/master/video-swap-new/video-swap-new-ublock-origin.js) / [ublock (permalink)](https://raw.githubusercontent.com/pixeltris/TwitchAdSolutions/f8f86706daf90daa534b26bce5b2f01238667d5f/video-swap-new/video-swap-new-ublock-origin.js)
@@ -41,7 +52,7 @@ Alternatively:
 
 - Navigate to the uBlock Origin Dashboard (the extension options)
 - Under the `My filters` tab add `twitch.tv##+js(twitch-videoad)`.
-- Under the `Settings` tab, enable `I am an advanced user`, then click the cog that appears. Modify the value of `userResourcesLocation` from `unset` to the full url of the solution you wish to use (if a url is already in use, add a space after the existing url). e.g. `userResourcesLocation https://raw.githubusercontent.com/pixeltris/TwitchAdSolutions/master/vaft/vaft-ublock-origin.js` 
+- Under **Settings**, enable **I am an advanced user**, then open the cog. Put the Raw link for your chosen release in `userResourcesLocation`. Replace any older VAFT URL and keep other resource URLs separated by spaces.
 - To ensure uBlock Origin loads the script I recommend that you disable/enable the uBlock Origin extension (or restart your browser).
 
 To stop using a script remove the filter and make the url `unset`.
