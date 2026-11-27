@@ -827,7 +827,6 @@
             console.log('[VAFT] ad return playback unavailable: no unique playing video');
             return;
         }
-
         const [video] = videos;
         const began = performance.now();
         const initialTime = video.currentTime;

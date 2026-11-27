@@ -49,6 +49,7 @@ function loadWorker(filename, networkFetch) {
         const newline = source.indexOf('\n');
         assert.equal(source.slice(0, newline).trimEnd(), resourceHeader);
         source = source.slice(newline + 1);
+        assert.ok(source.trimEnd().split(/\r?\n/).every(line => line.trim()), 'uBlock Origin ends each custom resource at a blank line');
     }
 
     const warnings = [];
