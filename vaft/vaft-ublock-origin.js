@@ -25,7 +25,7 @@ twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     'use strict';
-    const vaftBuild = '37.0.2';
+    const vaftBuild = '37.0.3';
     const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
@@ -149,6 +149,7 @@ twitch-videoad.js text/javascript
                     ${getVideoCodecFamily.toString()}
                     ${compareStreamQuality.toString()}
                     ${getStreamForResolution.toString()}
+                    ${getAdResumeWindow.toString()}
                     ${processM3U8.toString()}
                     ${hookWorkerFetch.toString()}
                     ${declareOptions.toString()}
@@ -213,6 +214,8 @@ twitch-videoad.js text/javascript
                 this.addEventListener('message', (e) => {
                     if (e.data.key == 'UpdateAdBlockBanner') {
                         updateAdblockBanner(e.data);
+                    } else if (e.data.key == 'MeasureAdResume') {
+                        measureAdResume();
                     } else if (e.data.key == 'ReloadPlayer') {
                         doTwitchPlayerTask(false, true);
                     }
@@ -336,6 +339,7 @@ twitch-videoad.js text/javascript
                                 ResolutionList: [],
                                 BackupEncodingsM3U8Cache: [],
                                 ActiveBackupVariant: null,
+                                LastBackupWindow: null,
                                 IsMidroll: false,
                                 IsStrippingAdSegments: false,
                                 NumStrippedAdSegments: 0
@@ -499,6 +503,51 @@ twitch-videoad.js text/javascript
         }
         return best;
     }
+    function getAdResumeWindow(playlist) {
+        const sequence = Number(playlist.match(/^#EXT-X-MEDIA-SEQUENCE:(\d+)\s*$/m)?.[1]);
+        const unknown = { sequence: Number.isSafeInteger(sequence) ? sequence : null, startMs: null, endMs: null };
+        let durationMs = 0;
+        let startMs = null;
+        let segmentDurationMs = null;
+        let programTimeMs = null;
+        const dateTag = '#EXT-X-PROGRAM-DATE-TIME:';
+        for (const rawLine of playlist.split('\n')) {
+            const line = rawLine.trim();
+            if (line === '#EXT-X-DISCONTINUITY' || line === '#EXT-X-GAP') {
+                return unknown;
+            }
+            if (line.startsWith(dateTag)) {
+                const value = line.slice(dateTag.length);
+                programTimeMs = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? Date.parse(value) : NaN;
+                if (!Number.isFinite(programTimeMs)) {
+                    return unknown;
+                }
+            } else if (line.startsWith('#EXTINF:')) {
+                const milliseconds = 1000 * Number(line.slice('#EXTINF:'.length).split(',')[0]);
+                if (segmentDurationMs !== null || !Number.isFinite(milliseconds) || milliseconds <= 0) {
+                    return unknown;
+                }
+                segmentDurationMs = milliseconds;
+            } else if (line && !line.startsWith('#')) {
+                if (segmentDurationMs === null) {
+                    return unknown;
+                }
+                if (programTimeMs !== null) {
+                    const anchoredStartMs = programTimeMs - durationMs;
+                    if (startMs !== null && Math.abs(startMs - anchoredStartMs) > 50) {
+                        return unknown;
+                    }
+                    startMs ??= anchoredStartMs;
+                }
+                durationMs += segmentDurationMs;
+                segmentDurationMs = null;
+                programTimeMs = null;
+            }
+        }
+        return startMs === null || segmentDurationMs !== null
+            ? unknown
+            : { ...unknown, startMs, endMs: startMs + durationMs };
+    }
     async function processM3U8(url, textStr, realFetch) {
         const streamInfo = StreamInfosByUrl[url];
         if (!streamInfo) {
@@ -611,6 +660,7 @@ twitch-videoad.js text/javascript
                 }
             }
             const selected = backup ?? fallback;
+            streamInfo.LastBackupWindow = selected ? getAdResumeWindow(selected.text) : null;
             let label = 'original';
             if (selected) {
                 textStr = selected.text;
@@ -644,10 +694,12 @@ twitch-videoad.js text/javascript
         } else if (streamInfo.IsShowingAd) {
             const reloadReason = streamInfo.IsUsingModifiedM3U8 ? 'modified-master'
                 : ReloadPlayerAfterAd ? 'configured-reload' : null;
+            const backupWindow = streamInfo.LastBackupWindow;
             streamInfo.IsShowingAd = false;
             streamInfo.IsStrippingAdSegments = false;
             streamInfo.NumStrippedAdSegments = 0;
             streamInfo.ActiveBackupVariant = null;
+            streamInfo.LastBackupWindow = null;
             streamInfo.IsUsingModifiedM3U8 = false;
             const resume = reloadReason ? `reload reason=${reloadReason}` : 'direct';
             console.log(`Finished blocking ads [VAFT] resume=${resume}`);
@@ -656,6 +708,13 @@ twitch-videoad.js text/javascript
                 postMessage({
                     key: 'ReloadPlayer'
                 });
+            } else if (backupWindow) {
+                const liveWindow = getAdResumeWindow(textStr);
+                const hasClock = backupWindow.startMs !== null && liveWindow.startMs !== null;
+                const overlapMs = hasClock ? Math.max(0, Math.round(Math.min(backupWindow.endMs, liveWindow.endMs) - Math.max(backupWindow.startMs, liveWindow.startMs))) : 'unknown';
+                const edgeDeltaMs = hasClock ? Math.round(liveWindow.endMs - backupWindow.endMs) : 'unknown';
+                console.log(`[VAFT] ad return timeline: backupSequence=${backupWindow.sequence ?? 'unknown'} liveSequence=${liveWindow.sequence ?? 'unknown'} overlapMs=${overlapMs} edgeDeltaMs=${edgeDeltaMs}`);
+                postMessage({ key: 'MeasureAdResume' });
             }
         }
         postMessage({
@@ -748,6 +807,51 @@ twitch-videoad.js text/javascript
         lastFixTime: 0,
         isLive: true
     };
+    let isMeasuringAdResume = false;
+    function measureAdResume() {
+        if (isMeasuringAdResume) {
+            return;
+        }
+        const videos = Array.from(document.querySelectorAll('.video-player video')).filter(video => !video.paused && !video.ended);
+        if (videos.length !== 1 || !Number.isFinite(videos[0].currentTime)) {
+            console.log('[VAFT] ad return playback unavailable: no unique playing video');
+            return;
+        }
+
+        const [video] = videos;
+        const began = performance.now();
+        const initialTime = video.currentTime;
+        let furthestTime = initialTime;
+        let rewindMs = 0;
+        let seeks = 0;
+        let waits = 0;
+        function sample() {
+            const position = video.currentTime;
+            if (Number.isFinite(position)) {
+                furthestTime = Math.max(furthestTime, position);
+                rewindMs = Math.max(rewindMs, Math.round((furthestTime - position) * 1000));
+            }
+        }
+        const onSeeking = () => { seeks++; sample(); };
+        const onWaiting = () => { waits++; };
+        isMeasuringAdResume = true;
+        video.addEventListener('seeking', onSeeking);
+        video.addEventListener('waiting', onWaiting);
+        function poll() {
+            sample();
+            const elapsedMs = Math.round(performance.now() - began);
+            if (video.isConnected && elapsedMs < 5000) {
+                setTimeout(poll, 250);
+                return;
+            }
+            video.removeEventListener('seeking', onSeeking);
+            video.removeEventListener('waiting', onWaiting);
+            isMeasuringAdResume = false;
+            const progressMs = Number.isFinite(video.currentTime) ? Math.round((video.currentTime - initialTime) * 1000) : 'unknown';
+            console.log(`[VAFT] ad return playback: rewindMs=${rewindMs} seeks=${seeks} waits=${waits} progressMs=${progressMs} detached=${!video.isConnected} elapsedMs=${elapsedMs}`);
+        }
+        setTimeout(poll, 250);
+    }
     function monitorPlayerBuffering() {
         if (playerForMonitoringBuffering) {
             try {

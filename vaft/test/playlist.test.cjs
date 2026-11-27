@@ -27,6 +27,12 @@ function masterPlaylist(...variants) {
     return `#EXTM3U\n${legacyTime}\n${entries.join('')}`;
 }
 
+function mediaWindow(sequence, startSecond, label) {
+    const date = new Date(Date.UTC(2026, 0, 1, 12, 0, startSecond)).toISOString();
+    const segments = [0, 2, 4].map(offset => `#EXTINF:2,live\n${label}-${startSecond + offset}.ts\n`);
+    return `#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:${sequence}\n#EXT-X-PROGRAM-DATE-TIME:${date}\n${segments.join('')}`;
+}
+
 const live1080 = variant('live-1080', '1920x1080', 60);
 const low = variant('low', '640x360', 30);
 const best = variant('high', '1920x1080', 60);
@@ -65,8 +71,13 @@ function loadWorker(filename, networkFetch) {
             static createObjectURL(blob) { return blob.source; }
         },
         Worker: class {
-            constructor(source) { this.source = source; }
-            addEventListener() {}
+            constructor(source) {
+                this.source = source;
+                this.messageHandlers = [];
+            }
+            addEventListener(type, listener) {
+                if (type === 'message') this.messageHandlers.push(listener);
+            }
         }
     };
     page.window = page;
@@ -88,9 +99,12 @@ function loadWorker(filename, networkFetch) {
         }
     };
     worker.self = worker;
-    const workerSource = new page.Worker('blob:https://www.twitch.tv/test-worker').source;
-    runInNewContext(workerSource, worker, { filename: `${filename}:worker`, timeout: 1000 });
-    return { worker, warnings, logs };
+    const playbackWorker = new page.Worker('blob:https://www.twitch.tv/test-worker');
+    runInNewContext(playbackWorker.source, worker, { filename: `${filename}:worker`, timeout: 1000 });
+    function emitWorkerMessage(data) {
+        for (const listener of playbackWorker.messageHandlers) listener({ data });
+    }
+    return { page, worker, warnings, logs, emitWorkerMessage };
 }
 
 async function runQualityFixture(filename, { live = live1080, players, reading, chosen, profile, reason = 'matched-quality' }) {
@@ -105,7 +119,7 @@ async function runQualityFixture(filename, { live = live1080, players, reading, 
         assert.ok(responses.has(url), `Unexpected request for ${url}`);
         return new Response(responses.get(url));
     });
-    worker.Date = { now: () => time };
+    worker.Date = class extends Date { static now() { return time; } };
     worker.postMessage = ({ key }) => assert.equal(key, 'UpdateAdBlockBanner');
     await worker.fetch(legacyMasterUrl);
     const { BackupEncodingsM3U8Cache: cache } = worker.StreamInfos.fixture;
@@ -129,6 +143,41 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
             assert.ok(version);
             assert.ok(logs.includes(`[VAFT] page hooks installed build=${version}`));
             assert.ok(logs.includes(`hookWorkerFetch (vaft) build=${version}`));
+        });
+
+        await t.test('reports rewind and stalls without moving or pausing the video', () => {
+            const { page, logs, emitWorkerMessage } = loadWorker(filename, async () => { throw new Error('unexpected network request'); });
+            const video = Object.assign(new EventTarget(), { currentTime: 180, paused: false, ended: false, isConnected: true });
+            let now = 0;
+            const timers = [];
+            page.performance = { now: () => now };
+            page.document.querySelectorAll = () => [video];
+            page.setTimeout = (callback) => timers.push(callback);
+
+            emitWorkerMessage({ key: 'MeasureAdResume' });
+            assert.equal(timers.length, 1);
+            video.currentTime = 178;
+            video.dispatchEvent(new Event('seeking'));
+            video.dispatchEvent(new Event('waiting'));
+            now = 5000;
+            timers.shift()();
+            assert.ok(logs.includes('[VAFT] ad return playback: rewindMs=2000 seeks=1 waits=1 progressMs=-2000 detached=false elapsedMs=5000'));
+            assert.equal(video.currentTime, 178);
+            assert.equal(video.paused, false);
+            assert.equal(timers.length, 0);
+        });
+
+        await t.test('keeps timing unknown if the playlist lacks a clock or has a discontinuity', () => {
+            const { worker } = loadWorker(filename, async () => { throw new Error('unexpected network request'); });
+            const timed = mediaWindow(700, 4, 'live');
+            const undated = timed.replace(/^#EXT-X-PROGRAM-DATE-TIME:.*\n/m, '');
+            const discontinuous = timed.replace('#EXTINF:', '#EXT-X-DISCONTINUITY\n#EXTINF:');
+            for (const playlist of [undated, discontinuous]) {
+                const window = worker.getAdResumeWindow(playlist);
+                assert.equal(window.sequence, 700);
+                assert.equal(window.startMs, null);
+                assert.equal(window.endMs, null);
+            }
         });
 
         await t.test('reuses a master whose variant URL has a query string', { timeout: 1500 }, async () => {
@@ -306,7 +355,8 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
                 const live = modifiedMaster ? { ...live1080, codec: 'hvc1.1.6.L90.B0' } : live1080;
                 const backup = { ...best, codec: live.codec };
                 const master = modifiedMaster ? masterPlaylist(live, hd) : masterPlaylist(live);
-                const resumedPlaylist = mediaPlaylist.replace('segment.ts', 'live-after-ad.ts');
+                const backupPlaylist = mediaWindow(850, 0, 'backup');
+                const resumedPlaylist = mediaWindow(1122, 4, 'live-after-ad');
                 let incomingPlaylist = adPlaylist;
                 let time = 10000;
                 const actions = [];
@@ -314,16 +364,16 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
                     if (url === legacyMasterUrl) return new Response(master);
                     if (url === live.url) return new Response(incomingPlaylist);
                     assert.equal(url, backup.url);
-                    return new Response(mediaPlaylist);
+                    return new Response(backupPlaylist);
                 });
-                worker.Date = { now: () => time };
+                worker.Date = class extends Date { static now() { return time; } };
                 worker.postMessage = ({ key }) => actions.push(key);
                 if (forceReload) worker.ReloadPlayerAfterAd = true;
 
                 await worker.fetch(legacyMasterUrl);
                 const stream = worker.StreamInfos.fixture;
                 stream.BackupEncodingsM3U8Cache.embed = masterPlaylist(backup);
-                assert.equal(await (await worker.fetch(live.url)).text(), mediaPlaylist);
+                assert.equal(await (await worker.fetch(live.url)).text(), backupPlaylist);
                 assert.equal(stream.IsUsingModifiedM3U8, Boolean(modifiedMaster));
                 assert.deepEqual(actions.filter((key) => key !== 'UpdateAdBlockBanner'), modifiedMaster ? ['ReloadPlayer'] : []);
 
@@ -332,12 +382,15 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
                 time = 11000;
                 assert.equal(await (await worker.fetch(live.url)).text(), resumedPlaylist);
                 assert.equal(await (await worker.fetch(live.url)).text(), resumedPlaylist);
-                assert.deepEqual(actions.filter((key) => key !== 'UpdateAdBlockBanner'), modifiedMaster || forceReload ? ['ReloadPlayer'] : []);
+                assert.deepEqual(actions.filter((key) => key !== 'UpdateAdBlockBanner'), modifiedMaster || forceReload ? ['ReloadPlayer'] : ['MeasureAdResume']);
                 assert.equal(stream.LastPlayerReload, modifiedMaster || forceReload ? 11000 : 10000);
                 assert.equal(stream.IsShowingAd, false);
                 assert.equal(stream.IsUsingModifiedM3U8, false);
                 assert.equal(await (await worker.fetch(legacyMasterUrl)).text(), master);
                 assert.ok(logs.includes(`Finished blocking ads [VAFT] resume=${resume}`));
+                if (!modifiedMaster && !forceReload) {
+                    assert.ok(logs.includes('[VAFT] ad return timeline: backupSequence=850 liveSequence=1122 overlapMs=2000 edgeDeltaMs=4000'));
+                }
                 assert.deepEqual(warnings, []);
             });
         }
