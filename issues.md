@@ -1,5 +1,7 @@
 # Issues with `vaft` / `video-swap-new`
 
+> Historical notes from the original TwitchAdSolutions project. For the maintained build, see [installation and verification](README.md#verify-installation).
+
 ## Neither script works
 
 If you're using the uBlock Origin version of the script you need to make sure that it's set up correctly based on the instructions in the README. Check the script is active by opening your browsers developer console, refreshing a stream, and searching for `hookWorkerFetch (vaft)` / `hookWorkerFetch (video-swap-new)`. If you don't see this, then the script isn't being injected and you need to find the reason why.

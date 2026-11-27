@@ -1,3 +1,5 @@
+> Historical list from the original TwitchAdSolutions project. For the maintained VAFT build, see the [installation guide](README.md).
+
 ## Twitch Turbo
 
 - `Twitch Turbo` - https://www.twitch.tv/turbo
