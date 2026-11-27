@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Free Adv Twitch Script
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
-// @version      37.0.3
+// @version      37.0.4
 // @description  Multiple solutions for blocking Twitch ads (vaft)
 // @downloadURL  none
 // @author       https://github.com/cleanlock/VideoAdBlockForTwitch#credits
@@ -35,7 +35,7 @@
  */
 (function() {
     'use strict';
-    const vaftBuild = '37.0.3';
+    const vaftBuild = '37.0.4';
     const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
@@ -53,6 +53,8 @@
             //'picture-by-picture-CACHED'//360p (-CACHED is an internal suffix and is removed)
         ];
         scope.FallbackPlayerType = 'embed';
+        scope.BackupSearchBudgetMs = 2500;
+        scope.BackupUpgradeBudgetMs = 350;
         scope.ForceAccessTokenPlayerType = 'popout';
         scope.SkipPlayerReloadOnHevc = false;// If true this will skip player reload on streams which have 2k/4k quality (if you enable this and you use the 2k/4k quality setting you'll get error #4000 / #3000 / spinning wheel on chrome based browsers)
         scope.AlwaysReloadPlayerOnAd = false;// Always pause/play when entering/leaving ads
@@ -230,14 +232,25 @@
                         doTwitchPlayerTask(false, true);
                     }
                 });
+                const workerFetchControllers = new Map();
                 this.addEventListener('message', async event => {
-                    if (event.data.key == 'FetchRequest') {
-                        const fetchRequest = event.data.value;
-                        const responseData = await handleWorkerFetchRequest(fetchRequest);
-                        this.postMessage({
-                            key: 'FetchResponse',
-                            value: responseData
-                        });
+                    const { key, value } = event.data;
+                    if (key === 'CancelFetchRequest') {
+                        workerFetchControllers.get(value)?.abort();
+                        return;
+                    }
+                    if (key !== 'FetchRequest') {
+                        return;
+                    }
+                    const controller = new AbortController();
+                    workerFetchControllers.set(value.id, controller);
+                    try {
+                        const responseData = await handleWorkerFetchRequest(value, controller.signal);
+                        if (!controller.signal.aborted) {
+                            this.postMessage({ key: 'FetchResponse', value: responseData });
+                        }
+                    } finally {
+                        workerFetchControllers.delete(value.id);
                     }
                 });
             }
@@ -611,63 +624,78 @@
             let backup = null;
             let fallback = null;
             let profilesTried = 0;
+            const searchController = new AbortController();
+            const { signal } = searchController;
+            const searchTimer = setTimeout(() => searchController.abort(), BackupSearchBudgetMs);
+            let upgradeTimer;
             // During reloads, try each player type once before retrying on the next playlist request.
             const attemptsPerPlayer = streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime ? 1 : 2;
-            for (let playerTypeIndex = 0; !backup?.variant.matchesCurrentQuality && playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
-                profilesTried++;
-                const playerType = BackupPlayerTypes[playerTypeIndex];
-                const realPlayerType = playerType.replace('-CACHED', '');
-                const isFullyCachedPlayerType = playerType != realPlayerType;
-                for (let i = 0; i < attemptsPerPlayer; i++) {
-                    // This caches the m3u8 if it doesn't have ads. If the already existing cache has ads it fetches a new version (second loop)
-                    let isFreshM3u8 = false;
-                    let encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType];
-                    if (!encodingsM3u8) {
-                        isFreshM3u8 = true;
-                        try {
-                            const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, realPlayerType);
-                            if (accessTokenResponse.status === 200) {
-                                const accessToken = await accessTokenResponse.json();
-                                const urlInfo = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + streamInfo.ChannelName + '.m3u8' + streamInfo.UsherParams);
-                                urlInfo.searchParams.set('sig', accessToken.data.streamPlaybackAccessToken.signature);
-                                urlInfo.searchParams.set('token', accessToken.data.streamPlaybackAccessToken.value);
-                                const encodingsM3u8Response = await realFetch(urlInfo.href);
-                                if (encodingsM3u8Response.status === 200) {
-                                    encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType] = await encodingsM3u8Response.text();
-                                }
-                            }
-                        } catch (err) {}
-                    }
-                    if (encodingsM3u8) {
-                        try {
-                            const variant = getStreamForResolution(encodingsM3u8, currentResolution);
-                            if (variant && backup && compareStreamQuality(variant, backup.variant) <= 0) {
-                                break;
-                            }
-                            const streamM3u8Response = variant ? await realFetch(variant.url) : null;
-                            if (streamM3u8Response?.status === 200) {
-                                const m3u8Text = await streamM3u8Response.text();
-                                if (m3u8Text) {
-                                    const candidate = { playerType, variant, text: m3u8Text };
-                                    if (!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) {
-                                        backup = candidate;
-                                        break;
-                                    }
-                                    if (playerType === FallbackPlayerType || (!fallback && playerTypeIndex === BackupPlayerTypes.length - 1)) {
-                                        fallback = candidate;
-                                    }
-                                    if (isFullyCachedPlayerType) {
-                                        break;
+            try {
+                for (let playerTypeIndex = 0; !signal.aborted && !backup?.variant.matchesCurrentQuality && playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
+                    profilesTried++;
+                    const playerType = BackupPlayerTypes[playerTypeIndex];
+                    const realPlayerType = playerType.replace('-CACHED', '');
+                    const isFullyCachedPlayerType = playerType != realPlayerType;
+                    for (let i = 0; !signal.aborted && i < attemptsPerPlayer; i++) {
+                        // This caches the m3u8 if it doesn't have ads. If the already existing cache has ads it fetches a new version (second loop)
+                        let isFreshM3u8 = false;
+                        let encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType];
+                        if (!encodingsM3u8) {
+                            isFreshM3u8 = true;
+                            try {
+                                const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, realPlayerType, signal);
+                                if (accessTokenResponse.status === 200) {
+                                    const accessToken = await accessTokenResponse.json();
+                                    const urlInfo = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + streamInfo.ChannelName + '.m3u8' + streamInfo.UsherParams);
+                                    urlInfo.searchParams.set('sig', accessToken.data.streamPlaybackAccessToken.signature);
+                                    urlInfo.searchParams.set('token', accessToken.data.streamPlaybackAccessToken.value);
+                                    const encodingsM3u8Response = await realFetch(urlInfo.href, { signal });
+                                    if (encodingsM3u8Response.status === 200) {
+                                        encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType] = await encodingsM3u8Response.text();
                                     }
                                 }
-                            }
-                        } catch (err) {}
-                    }
-                    streamInfo.BackupEncodingsM3U8Cache[playerType] = null;
-                    if (isFreshM3u8) {
-                        break;
+                            } catch (err) {}
+                        }
+                        if (encodingsM3u8) {
+                            try {
+                                const variant = getStreamForResolution(encodingsM3u8, currentResolution);
+                                if (variant && backup && compareStreamQuality(variant, backup.variant) <= 0) {
+                                    break;
+                                }
+                                const streamM3u8Response = variant ? await realFetch(variant.url, { signal }) : null;
+                                if (streamM3u8Response?.status === 200) {
+                                    const m3u8Text = await streamM3u8Response.text();
+                                    if (m3u8Text) {
+                                        const candidate = { playerType, variant, text: m3u8Text };
+                                        if (!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) {
+                                            if (!backup && !variant.matchesCurrentQuality) {
+                                                upgradeTimer = setTimeout(() => searchController.abort(), BackupUpgradeBudgetMs);
+                                            }
+                                            backup = candidate;
+                                            break;
+                                        }
+                                        if (playerType === FallbackPlayerType || (!fallback && playerTypeIndex === BackupPlayerTypes.length - 1)) {
+                                            fallback = candidate;
+                                        }
+                                        if (isFullyCachedPlayerType) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } catch (err) {}
+                        }
+                        if (signal.aborted) {
+                            break;
+                        }
+                        streamInfo.BackupEncodingsM3U8Cache[playerType] = null;
+                        if (isFreshM3u8) {
+                            break;
+                        }
                     }
                 }
+            } finally {
+                clearTimeout(searchTimer);
+                clearTimeout(upgradeTimer);
             }
             const selected = backup ?? fallback;
             streamInfo.LastBackupWindow = selected ? getAdResumeWindow(selected.text) : null;
@@ -680,7 +708,7 @@
             const reason = backup?.variant.matchesCurrentQuality ? 'matched-quality'
                 : backup ? 'lower-quality'
                 : fallback ? 'fallback-profile' : 'no-usable-variant';
-            const decision = `${label}, ${reason}`;
+            const decision = `${label}, ${reason}, ${signal.aborted}`;
             if (streamInfo.ActiveBackupVariant !== decision) {
                 streamInfo.ActiveBackupVariant = decision;
                 const targetResolution = /^\d+x\d+$/.test(currentResolution.Resolution) ? currentResolution.Resolution : 'unknown';
@@ -692,7 +720,8 @@
                     `targetFps=${targetFps}`,
                     `reason=${reason}`,
                     `profiles=${profilesTried}`,
-                    `elapsedMs=${elapsedMs}`
+                    `elapsedMs=${elapsedMs}`,
+                    `deadline=${signal.aborted}`
                 ];
                 console.log(`Blocking ${adKind} (${label}) [VAFT] ${diagnostics.join(' ')}`);
             }
@@ -748,7 +777,7 @@
                 return [key, Number.isNaN(num) ? value.startsWith('"') ? JSON.parse(value) : value : num];
             }));
     }
-    function getAccessToken(channelName, playerType) {
+    function getAccessToken(channelName, playerType, signal) {
         const body = {
             operationName: 'PlaybackAccessToken',
             variables: {
@@ -766,9 +795,9 @@
                 }
             }
         };
-        return gqlRequest(body, playerType);
+        return gqlRequest(body, signal);
     }
-    function gqlRequest(body, playerType) {
+    function gqlRequest(body, signal) {
         if (!GQLDeviceID) {
             GQLDeviceID = '';
             const dcharacters = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -786,6 +815,10 @@
             ...(ClientSession && {'Client-Session-Id': ClientSession})
         };
         return new Promise((resolve, reject) => {
+            if (signal.aborted) {
+                reject(signal.reason);
+                return;
+            }
             const requestId = Math.random().toString(36).substring(2, 15);
             const fetchRequest = {
                 id: requestId,
@@ -796,10 +829,17 @@
                     headers
                 }
             };
-            pendingFetchRequests.set(requestId, {
-                resolve,
-                reject
-            });
+            const onAbort = () => {
+                pendingFetchRequests.delete(requestId);
+                postMessage({ key: 'CancelFetchRequest', value: requestId });
+                reject(signal.reason);
+            };
+            const settle = complete => value => {
+                signal.removeEventListener('abort', onAbort);
+                complete(value);
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            pendingFetchRequests.set(requestId, { resolve: settle(resolve), reject: settle(reject) });
             postMessage({
                 key: 'FetchRequest',
                 value: fetchRequest
@@ -1079,9 +1119,9 @@
             worker.postMessage({key: key, value: value});
         });
     }
-    async function handleWorkerFetchRequest(fetchRequest) {
+    async function handleWorkerFetchRequest(fetchRequest, signal) {
         try {
-            const response = await window.realFetch(fetchRequest.url, fetchRequest.options);
+            const response = await window.realFetch(fetchRequest.url, { ...fetchRequest.options, signal });
             const responseBody = await response.text();
             const responseObject = {
                 id: fetchRequest.id,

@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
+const { once } = require('node:events');
 const { readFileSync } = require('node:fs');
+const { createServer } = require('node:http');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { runInNewContext } = require('node:vm');
@@ -56,6 +58,7 @@ function loadWorker(filename, networkFetch) {
     const logs = [];
     const logger = { log(message) { logs.push(message); }, warn(message) { warnings.push(message); } };
     const page = {
+        AbortController,
         console: logger,
         document: {
             location: { hostname: 'www.twitch.tv' },
@@ -87,6 +90,9 @@ function loadWorker(filename, networkFetch) {
     const worker = {
         URL,
         Response,
+        AbortController,
+        setTimeout,
+        clearTimeout,
         console: logger,
         fetch: networkFetch,
         addEventListener() {},
@@ -131,8 +137,38 @@ async function runQualityFixture(filename, { live = live1080, players, reading, 
     const result = await worker.fetch(live.url);
     assert.equal(await result.text(), responses.get(chosen.url));
     assert.deepEqual(requests, reading.map(([url]) => url));
-    assert.ok(logs.includes(`Blocking midroll ads (${profile}, ${chosen.resolution} @ ${chosen.frameRate} fps) [VAFT] target=${live.resolution} targetFps=${live.frameRate} reason=${reason} profiles=${reading.length} elapsedMs=${42 * reading.length}`));
+    assert.ok(logs.includes(`Blocking midroll ads (${profile}, ${chosen.resolution} @ ${chosen.frameRate} fps) [VAFT] target=${live.resolution} targetFps=${live.frameRate} reason=${reason} profiles=${reading.length} elapsedMs=${42 * reading.length} deadline=false`));
     assert.deepEqual(warnings, []);
+}
+
+function waitForNetworkAbort(signal) {
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+}
+
+async function runNetworkFixture(filename, { cache, reply, searchMs = 250, upgradeMs = 45, relay = false }) {
+    const messages = [];
+    const { worker, warnings, logs, emitWorkerMessage } = loadWorker(filename, async (url, options) => {
+        if (url === legacyMasterUrl) return new Response(masterPlaylist(live1080));
+        if (url === live1080.url) return new Response(adPlaylist);
+        return reply(url, options);
+    });
+    worker.BackupSearchBudgetMs = searchMs;
+    worker.BackupUpgradeBudgetMs = upgradeMs;
+    worker.postMessage = message => {
+        messages.push(message.key);
+        if (relay) emitWorkerMessage(message);
+    };
+    await worker.fetch(legacyMasterUrl);
+    const saved = worker.StreamInfos.fixture.BackupEncodingsM3U8Cache;
+    for (const [profile, variantInfo] of Object.entries(cache)) {
+        saved[profile] = masterPlaylist(variantInfo);
+    }
+    const result = await (await worker.fetch(live1080.url)).text();
+    assert.deepEqual(warnings, []);
+    return { result, logs, messages };
 }
 
 for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
@@ -345,6 +381,115 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
                 profile: 'autoplay',
                 reason: 'lower-quality'
             });
+        });
+
+        await t.test('keeps the ready 360p variant when a better media request stalls', { timeout: 1500 }, async () => {
+            const requests = [];
+            let upgradeSignal;
+            const { result, logs } = await runNetworkFixture(filename, {
+                cache: { embed: low, popout: best, autoplay: hd },
+                reply(url, { signal }) {
+                    requests.push(url);
+                    if (url === low.url) return new Response(mediaPlaylist);
+                    assert.equal(url, best.url);
+                    upgradeSignal = signal;
+                    return waitForNetworkAbort(signal);
+                }
+            });
+            assert.deepEqual(requests, [low.url, best.url]);
+            assert.ok(upgradeSignal.aborted);
+            assert.equal(result, mediaPlaylist);
+            assert.ok(logs.some(line => line.includes('embed, 640x360') && line.includes('deadline=true')));
+        });
+
+        await t.test('still chooses 1080p when delivery recovers inside the upgrade window', { timeout: 1500 }, async () => {
+            const highPlaylist = mediaPlaylist.replace('segment.ts', 'high.ts');
+            const requests = [];
+            const { result, logs } = await runNetworkFixture(filename, {
+                cache: { embed: low, popout: hd, autoplay: best },
+                upgradeMs: 140,
+                async reply(url, { signal }) {
+                    requests.push(url);
+                    if (url === low.url) return new Response(mediaPlaylist);
+                    if (url === hd.url) return new Response(null, { status: 503 });
+                    assert.equal(url, best.url);
+                    await new Promise(resolve => setTimeout(resolve, 8));
+                    assert.equal(signal.aborted, false);
+                    return new Response(highPlaylist);
+                }
+            });
+            assert.deepEqual(requests, [low.url, hd.url, best.url]);
+            assert.equal(result, highPlaylist);
+            assert.ok(logs.some(line => line.includes('autoplay, 1920x1080') && line.includes('deadline=false')));
+        });
+
+        await t.test('returns the original playlist if the search deadline expires before a confirmed alternative', { timeout: 1500 }, async () => {
+            const requests = [];
+            let bodySignal;
+            const { result, logs } = await runNetworkFixture(filename, {
+                cache: { embed: best, popout: hd, autoplay: low },
+                searchMs: 45,
+                reply(url, { signal }) {
+                    requests.push(url);
+                    bodySignal = signal;
+                    return { status: 200, text: () => waitForNetworkAbort(signal) };
+                }
+            });
+            assert.deepEqual(requests, [best.url]);
+            assert.ok(bodySignal.aborted);
+            assert.equal(result, adPlaylist);
+            assert.ok(logs.some(line => line.includes('no-usable-variant') && line.includes('deadline=true')));
+        });
+
+        await t.test('cancels a slow page relay after a usable alternate stream is ready', { timeout: 1500 }, async () => {
+            let relaySignal;
+            const { result, messages } = await runNetworkFixture(filename, {
+                cache: { embed: low },
+                relay: true,
+                reply(url, options) {
+                    if (url === low.url) return new Response(mediaPlaylist);
+                    assert.equal(options.method, 'POST');
+                    relaySignal = options.signal;
+                    return waitForNetworkAbort(relaySignal);
+                }
+            });
+            assert.equal(result, mediaPlaylist);
+            assert.ok(relaySignal.aborted);
+            assert.deepEqual(messages.filter(key => key !== 'UpdateAdBlockBanner'), ['FetchRequest', 'CancelFetchRequest']);
+        });
+
+        await t.test('aborts a real HTTP response stalled mid-body and uses the already loaded 360p playlist', { timeout: 2500 }, async (t) => {
+            const closed = Promise.withResolvers();
+            const server = createServer((_request, response) => {
+                response.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+                response.write('#EXTM3U\n');
+                response.once('close', closed.resolve);
+            });
+            t.after(() => {
+                server.closeAllConnections();
+                return new Promise(resolve => server.close(resolve));
+            });
+            server.listen(0, '127.0.0.1');
+            await once(server, 'listening');
+
+            const localUrl = `http://127.0.0.1:${server.address().port}/high.m3u8`;
+            let readHeaders = false;
+            const { result, logs } = await runNetworkFixture(filename, {
+                cache: { embed: low, popout: { ...best, url: localUrl } },
+                searchMs: 750,
+                upgradeMs: 250,
+                async reply(url, options) {
+                    if (url === low.url) return new Response(mediaPlaylist);
+                    assert.equal(url, localUrl);
+                    const response = await fetch(url, options);
+                    readHeaders = true;
+                    return response;
+                }
+            });
+            assert.ok(readHeaders);
+            assert.equal(result, mediaPlaylist);
+            assert.ok(logs.some(line => line.includes('deadline=true')));
+            await closed.promise;
         });
 
         for (const { name, modifiedMaster, forceReload, resume } of [
