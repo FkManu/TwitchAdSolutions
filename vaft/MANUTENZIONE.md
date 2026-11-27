@@ -28,12 +28,13 @@ Per ogni playlist master, `getStreamForResolution` considera le varianti entro r
 
 ## Aggiornamenti futuri
 
-### Diagnostica della build 37.0.1
+### Diagnostica
 
 - `[VAFT] page hooks installed` e `hookWorkerFetch (vaft)` riportano la build nel contesto della pagina e in quello del worker del player.
 - `Blocking ads` riporta la variante selezionata, la qualità di partenza (`target` e `targetFps`), quanti profili sono stati considerati (`profiles`) e il tempo di selezione (`elapsedMs`). `reason` distingue qualità corrispondente (`matched-quality`), qualità inferiore (`lower-quality`), profilo di ripiego (`fallback-profile`) e playlist originale (`no-usable-variant`).
 - `master cache refresh` indica che VAFT ricostruisce la cache partendo dalla playlist master appena ricevuta. Il controllo usa l'URL già letto dalla playlist, compresi i parametri. Se quel controllo fallisce, il log indica il codice HTTP o il tipo di errore.
 - `original playlist returned` distingue playlist master e media e indica se il problema è avvenuto durante lettura (`read`) o elaborazione (`process`). Queste righe evitano URL, token e messaggi grezzi di eccezione.
+- Da `37.0.2`, `Finished blocking ads [VAFT] resume=direct` indica che VAFT restituisce la playlist originale e lascia al player la ripresa. Se VAFT aveva attivato una playlist master modificata, ripristina l'originale e richiede una ricarica (`resume=reload reason=modified-master`). `ReloadPlayerAfterAd` può forzare la ricarica per un test (`reason=configured-reload`). Il monitor del buffering continua a intervenire in caso di stallo.
 
 ### Flusso di prova e rilascio
 

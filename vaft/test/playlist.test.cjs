@@ -296,5 +296,50 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
                 reason: 'lower-quality'
             });
         });
+
+        for (const { name, modifiedMaster, forceReload, resume } of [
+            { name: 'smooth ad exit with a compatible stream', resume: 'direct' },
+            { name: 'ad exit after a codec-driven master replacement', modifiedMaster: true, resume: 'reload reason=modified-master' },
+            { name: 'ad exit with an explicit reload override', forceReload: true, resume: 'reload reason=configured-reload' }
+        ]) {
+            await t.test(name, { timeout: 1500 }, async () => {
+                const live = modifiedMaster ? { ...live1080, codec: 'hvc1.1.6.L90.B0' } : live1080;
+                const backup = { ...best, codec: live.codec };
+                const master = modifiedMaster ? masterPlaylist(live, hd) : masterPlaylist(live);
+                const resumedPlaylist = mediaPlaylist.replace('segment.ts', 'live-after-ad.ts');
+                let incomingPlaylist = adPlaylist;
+                let time = 10000;
+                const actions = [];
+                const { worker, warnings, logs } = loadWorker(filename, async (url) => {
+                    if (url === legacyMasterUrl) return new Response(master);
+                    if (url === live.url) return new Response(incomingPlaylist);
+                    assert.equal(url, backup.url);
+                    return new Response(mediaPlaylist);
+                });
+                worker.Date = { now: () => time };
+                worker.postMessage = ({ key }) => actions.push(key);
+                if (forceReload) worker.ReloadPlayerAfterAd = true;
+
+                await worker.fetch(legacyMasterUrl);
+                const stream = worker.StreamInfos.fixture;
+                stream.BackupEncodingsM3U8Cache.embed = masterPlaylist(backup);
+                assert.equal(await (await worker.fetch(live.url)).text(), mediaPlaylist);
+                assert.equal(stream.IsUsingModifiedM3U8, Boolean(modifiedMaster));
+                assert.deepEqual(actions.filter((key) => key !== 'UpdateAdBlockBanner'), modifiedMaster ? ['ReloadPlayer'] : []);
+
+                actions.length = 0;
+                incomingPlaylist = resumedPlaylist;
+                time = 11000;
+                assert.equal(await (await worker.fetch(live.url)).text(), resumedPlaylist);
+                assert.equal(await (await worker.fetch(live.url)).text(), resumedPlaylist);
+                assert.deepEqual(actions.filter((key) => key !== 'UpdateAdBlockBanner'), modifiedMaster || forceReload ? ['ReloadPlayer'] : []);
+                assert.equal(stream.LastPlayerReload, modifiedMaster || forceReload ? 11000 : 10000);
+                assert.equal(stream.IsShowingAd, false);
+                assert.equal(stream.IsUsingModifiedM3U8, false);
+                assert.equal(await (await worker.fetch(legacyMasterUrl)).text(), master);
+                assert.ok(logs.includes(`Finished blocking ads [VAFT] resume=${resume}`));
+                assert.deepEqual(warnings, []);
+            });
+        }
     });
 }

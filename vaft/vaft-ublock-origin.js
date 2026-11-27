@@ -25,7 +25,7 @@ twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     'use strict';
-    const vaftBuild = '37.0.1';
+    const vaftBuild = '37.0.2';
     const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
@@ -46,7 +46,7 @@ twitch-videoad.js text/javascript
         scope.ForceAccessTokenPlayerType = 'popout';
         scope.SkipPlayerReloadOnHevc = false;// If true this will skip player reload on streams which have 2k/4k quality (if you enable this and you use the 2k/4k quality setting you'll get error #4000 / #3000 / spinning wheel on chrome based browsers)
         scope.AlwaysReloadPlayerOnAd = false;// Always pause/play when entering/leaving ads
-        scope.ReloadPlayerAfterAd = true;// After the ad finishes do a player reload instead of pause/play
+        scope.ReloadPlayerAfterAd = false;// Force a player reload after ads even when the master playlist did not change
         scope.PlayerReloadMinimalRequestsTime = 1500;
         scope.HasTriggeredPlayerReload = false;
         scope.StreamInfos = [];
@@ -213,8 +213,6 @@ twitch-videoad.js text/javascript
                 this.addEventListener('message', (e) => {
                     if (e.data.key == 'UpdateAdBlockBanner') {
                         updateAdblockBanner(e.data);
-                    } else if (e.data.key == 'PauseResumePlayer') {
-                        doTwitchPlayerTask(true, false);
                     } else if (e.data.key == 'ReloadPlayer') {
                         doTwitchPlayerTask(false, true);
                     }
@@ -644,20 +642,19 @@ twitch-videoad.js text/javascript
                 textStr = stripAdSegments(textStr, stripHevc, streamInfo);
             }
         } else if (streamInfo.IsShowingAd) {
-            console.log('Finished blocking ads');
+            const reloadReason = streamInfo.IsUsingModifiedM3U8 ? 'modified-master'
+                : ReloadPlayerAfterAd ? 'configured-reload' : null;
             streamInfo.IsShowingAd = false;
             streamInfo.IsStrippingAdSegments = false;
             streamInfo.NumStrippedAdSegments = 0;
             streamInfo.ActiveBackupVariant = null;
-            if (streamInfo.IsUsingModifiedM3U8 || ReloadPlayerAfterAd) {
-                streamInfo.IsUsingModifiedM3U8 = false;
+            streamInfo.IsUsingModifiedM3U8 = false;
+            const resume = reloadReason ? `reload reason=${reloadReason}` : 'direct';
+            console.log(`Finished blocking ads [VAFT] resume=${resume}`);
+            if (reloadReason) {
                 streamInfo.LastPlayerReload = Date.now();
                 postMessage({
                     key: 'ReloadPlayer'
-                });
-            } else {
-                postMessage({
-                    key: 'PauseResumePlayer'
                 });
             }
         }
