@@ -40,6 +40,12 @@ Per ogni playlist master, `getStreamForResolution` considera le varianti entro r
 
 Lo stress test `node vaft/test/simulate-throughput.cjs` confronta bitrate costanti su tracce sintetiche di connessione. Simula il download di 15 segmenti di due secondi, già disponibili, con quattro secondi di buffer iniziale. Il modello misura l'effetto della banda sul buffer. La suite delle playlist verifica invece decisioni e annullamento delle richieste con risposte lente o fallite. Il tempo per scaricare un manifest non è una stima del bitrate video sostenibile.
 
+### Ordine delle playlist nella 37.0.5 sperimentale
+
+Il worker numera i poll video prima del fetch. Una risposta più recente può cancellare la ricerca di riserva superata e, per la stessa variante, fornire il risultato corrente anche al poll precedente. Poll sovrapposti con annunci sulla stessa variante condividono una sola ricerca. Una nuova sessione del canale invalida le operazioni rimaste aperte. [xBandaku #17](https://github.com/xBandaku/TwitchAdSolutions/pull/17)
+
+Durante la stessa interruzione il worker può riprovare in anticipo un profilo HD già confermato. La prova legge la variante dalla master in cache e ha al massimo 350 ms all'interno del limite complessivo di 2,5 secondi. Se la riserva rallenta, la ricerca prosegue nell'ordine normale. [Helli24 #33](https://github.com/Helli24/TwitchAdSolutions/pull/33)
+
 ### Flusso di prova e rilascio
 
 1. Registra il sintomo e la versione in uso. Se mancano i messaggi del worker, parti dall'iniezione dello script. Se manca una qualità o una playlist si blocca, parti dal ramo master. Se il player resta in buffering a playlist valida, parti dal monitor del player.

@@ -492,6 +492,139 @@ for (const filename of ['vaft-ublock-origin.js', 'vaft.user.js']) {
             await closed.promise;
         });
 
+        await t.test('cancels a late backup and reuses the newer live playlist', { timeout: 1500 }, async () => {
+            const started = Promise.withResolvers();
+            const backup = Promise.withResolvers();
+            const livePlaylist = mediaWindow(1122, 4, 'resumed');
+            let livePolls = 0;
+            const { worker, logs } = loadWorker(filename, async (url, options) => {
+                if (url === legacyMasterUrl) return new Response(masterPlaylist(live1080));
+                if (url === live1080.url) return new Response(livePolls++ === 0 ? adPlaylist : livePlaylist);
+                assert.equal(url, best.url);
+                started.resolve(options.signal);
+                return backup.promise;
+            });
+            worker.postMessage = () => {};
+            await worker.fetch(legacyMasterUrl);
+            const stream = worker.StreamInfos.fixture;
+            stream.BackupEncodingsM3U8Cache.embed = masterPlaylist(best);
+
+            const older = worker.fetch(live1080.url);
+            const signal = await started.promise;
+            assert.equal(await (await worker.fetch(live1080.url)).text(), livePlaylist);
+            assert.ok(signal.aborted);
+            backup.resolve(new Response(mediaWindow(850, 0, 'obsolete-backup')));
+            assert.equal(await (await older).text(), livePlaylist);
+            assert.equal(stream.IsShowingAd, false);
+            assert.equal(stream.LastBackupWindow, null);
+            assert.equal(stream.ActiveBackupVariant, null);
+            assert.ok(logs.includes('Finished blocking ads [VAFT] resume=direct'));
+            assert.ok(!logs.some(line => line.startsWith('Blocking midroll ads')));
+        });
+
+        await t.test('ignores an older native response that arrives after a newer one', { timeout: 1500 }, async () => {
+            const olderResponse = Promise.withResolvers();
+            const withQuery = { ...live1080, url: `${live1080.url}?fixture=1` };
+            const livePlaylist = mediaWindow(550, 0, 'current');
+            let livePolls = 0;
+            const { worker } = loadWorker(filename, async (url) => {
+                if (url === legacyMasterUrl) return new Response(masterPlaylist(withQuery));
+                assert.equal(url, withQuery.url);
+                return livePolls++ === 0 ? olderResponse.promise : new Response(livePlaylist);
+            });
+            worker.postMessage = () => {};
+            await worker.fetch(legacyMasterUrl);
+
+            const older = worker.fetch(withQuery.url);
+            assert.equal(await (await worker.fetch(withQuery.url)).text(), livePlaylist);
+            olderResponse.resolve(new Response(adPlaylist));
+            assert.equal(await (await older).text(), livePlaylist);
+            assert.equal(worker.StreamInfos.fixture.IsShowingAd, false);
+        });
+
+        await t.test('shares one search across overlapping ad polls and prefers an active HD backup', { timeout: 1500 }, async () => {
+            const started = Promise.withResolvers();
+            const backup = Promise.withResolvers();
+            const overlapRead = Promise.withResolvers();
+            const hdPlaylist = mediaWindow(850, 0, 'hd');
+            const requests = [];
+            let livePolls = 0;
+            let hdIsSlow = false;
+            const { worker } = loadWorker(filename, async (url, options) => {
+                if (url === legacyMasterUrl) return new Response(masterPlaylist(live1080));
+                if (url === live1080.url) {
+                    const response = new Response(adPlaylist);
+                    if (++livePolls === 2) {
+                        response.clone = () => ({ async text() { overlapRead.resolve(); return adPlaylist; } });
+                    }
+                    return response;
+                }
+                requests.push(url);
+                if (url === low.url) return new Response(mediaPlaylist);
+                assert.equal(url, best.url);
+                if (hdIsSlow) return waitForNetworkAbort(options.signal);
+                if (requests.length > 2) return new Response(hdPlaylist);
+                started.resolve(options.signal);
+                return backup.promise;
+            });
+            worker.postMessage = () => {};
+            await worker.fetch(legacyMasterUrl);
+            const cache = worker.StreamInfos.fixture.BackupEncodingsM3U8Cache;
+            cache.embed = masterPlaylist(low);
+            cache.popout = masterPlaylist(best);
+
+            const first = worker.fetch(live1080.url);
+            const signal = await started.promise;
+            const second = worker.fetch(live1080.url);
+            await overlapRead.promise;
+            await new Promise(setImmediate);
+            assert.equal(worker.StreamInfos.fixture.LatestMediaRequest.sequence, 2);
+            assert.ok(!signal.aborted);
+            backup.resolve(new Response(hdPlaylist));
+            assert.equal(await (await first).text(), hdPlaylist);
+            assert.equal(await (await second).text(), hdPlaylist);
+            assert.deepEqual(requests, [low.url, best.url]);
+
+            assert.equal(await (await worker.fetch(live1080.url)).text(), hdPlaylist);
+            assert.deepEqual(requests, [low.url, best.url, best.url]);
+
+            hdIsSlow = true;
+            worker.BackupUpgradeBudgetMs = 45;
+            assert.equal(await (await worker.fetch(live1080.url)).text(), mediaPlaylist);
+            assert.deepEqual(requests.slice(3), [best.url, low.url, best.url]);
+            assert.equal(worker.StreamInfos.fixture.PreferredBackupProfile, null);
+        });
+
+        await t.test('keeps a replacement stream session independent of an outstanding backup search', { timeout: 1500 }, async () => {
+            const started = Promise.withResolvers();
+            const backup = Promise.withResolvers();
+            let replacingMaster = false;
+            const { worker } = loadWorker(filename, async (url, options) => {
+                if (url === legacyMasterUrl) return new Response(masterPlaylist(live1080));
+                if (url === live1080.url) return replacingMaster ? new Response('', { status: 404 }) : new Response(adPlaylist);
+                assert.equal(url, best.url);
+                started.resolve(options.signal);
+                return backup.promise;
+            });
+            worker.postMessage = () => {};
+            await worker.fetch(legacyMasterUrl);
+            const oldStream = worker.StreamInfos.fixture;
+            oldStream.BackupEncodingsM3U8Cache.embed = masterPlaylist(best);
+
+            const older = worker.fetch(live1080.url);
+            const signal = await started.promise;
+            replacingMaster = true;
+            await worker.fetch(legacyMasterUrl);
+            const newStream = worker.StreamInfos.fixture;
+            assert.notEqual(newStream, oldStream);
+            assert.ok(signal.aborted);
+            backup.resolve(new Response(mediaPlaylist));
+            assert.equal(await (await older).text(), adPlaylist);
+            assert.equal(oldStream.LastBackupWindow, null);
+            assert.equal(newStream.IsShowingAd, false);
+            assert.equal(newStream.LatestMediaRequest, null);
+        });
+
         for (const { name, modifiedMaster, forceReload, resume } of [
             { name: 'smooth ad exit with a compatible stream', resume: 'direct' },
             { name: 'ad exit after a codec-driven master replacement', modifiedMaster: true, resume: 'reload reason=modified-master' },

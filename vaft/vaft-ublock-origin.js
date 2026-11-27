@@ -25,7 +25,7 @@ twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     'use strict';
-    const vaftBuild = '37.0.4';
+    const vaftBuild = '37.0.5';
     const ourTwitchAdSolutionsVersion = 24;// Used to prevent conflicts with outdated versions of the scripts
     if (typeof window.twitchAdSolutionsVersion !== 'undefined' && window.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
         console.log("skipping vaft as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + window.twitchAdSolutionsVersion);
@@ -303,6 +303,40 @@ twitch-videoad.js text/javascript
                 return response;
             }
         }
+        async function processOrderedMediaPlaylist(url, original, streamInfo, sequence) {
+            const isRegistered = () => StreamInfos[streamInfo.ChannelName] === streamInfo && StreamInfosByUrl[url] === streamInfo;
+            if (!streamInfo || !isRegistered() || !streamInfo.Urls[url]) {
+                return original;
+            }
+            let latest = streamInfo.LatestMediaRequest;
+            if (!latest || sequence > latest.sequence) {
+                const hasAds = original.includes(AdSignifier) || SimulatedAdsDepth > 0;
+                // Repeated ad polls for the same rendition share its running search and deadline.
+                if (hasAds && latest?.url === url && latest.searchController) {
+                    latest.sequence = sequence;
+                    latest.original = original;
+                } else {
+                    const previous = latest;
+                    latest = { url, sequence, original, hasAds, searchController: null, result: null };
+                    streamInfo.LatestMediaRequest = latest;
+                    previous?.searchController?.abort();
+                    latest.result = processM3U8(url, realFetch, streamInfo, latest);
+                }
+            }
+            while (latest?.url === url && isRegistered()) {
+                const result = await latest.result.catch(error => {
+                    if (latest === streamInfo.LatestMediaRequest && latest.sequence === sequence && isRegistered()) {
+                        throw error;
+                    }
+                    return latest.original;
+                });
+                if (latest === streamInfo.LatestMediaRequest && isRegistered()) {
+                    return result;
+                }
+                latest = streamInfo.LatestMediaRequest;
+            }
+            return original;
+        }
         fetch = async function(url, options) {
             if (typeof url === 'string') {
                 if (AdSegmentCache.has(url)) {
@@ -318,9 +352,11 @@ twitch-videoad.js text/javascript
                     });
                 }
                 url = url.trimEnd();
-                if (url.endsWith('m3u8')) {
+                const mediaStream = StreamInfosByUrl[url];
+                if (mediaStream || url.endsWith('m3u8')) {
+                    const sequence = mediaStream ? ++mediaStream.MediaRequestSequence : 0;
                     const response = await realFetch(url, options);
-                    return rewritePlaylistResponse(response, 'media', (text) => processM3U8(url, text, realFetch));
+                    return rewritePlaylistResponse(response, 'media', (text) => processOrderedMediaPlaylist(url, text, mediaStream, sequence));
                 } else if (url.includes('/channel/hls/') && !url.includes('picture-by-picture')) {
                     V2API = url.includes('/api/v2/');
                     const channelName = (new URL(url)).pathname.match(/([^\/]+)(?=\.\w+$)/)[0];
@@ -352,6 +388,9 @@ twitch-videoad.js text/javascript
                                 ResolutionList: [],
                                 BackupEncodingsM3U8Cache: [],
                                 ActiveBackupVariant: null,
+                                PreferredBackupProfile: null,
+                                MediaRequestSequence: 0,
+                                LatestMediaRequest: null,
                                 LastBackupWindow: null,
                                 IsMidroll: false,
                                 IsStrippingAdSegments: false,
@@ -404,10 +443,12 @@ twitch-videoad.js text/javascript
                                     streamInfo.ModifiedM3U8 = lines.join('\n');
                                 }
                             }
+                            const replacedStream = StreamInfos[channelName];
                             StreamInfos[channelName] = streamInfo;
                             for (const variantUrl of variantUrls) {
                                 StreamInfosByUrl[variantUrl] = streamInfo;
                             }
+                            replacedStream?.LatestMediaRequest?.searchController?.abort();
                         }
                         streamInfo.LastPlayerReload = Date.now();
                         return replaceServerTimeInM3u8(streamInfo.IsUsingModifiedM3U8 ? streamInfo.ModifiedM3U8 : streamInfo.EncodingsM3U8, serverTime);
@@ -561,17 +602,13 @@ twitch-videoad.js text/javascript
             ? unknown
             : { ...unknown, startMs, endMs: startMs + durationMs };
     }
-    async function processM3U8(url, textStr, realFetch) {
-        const streamInfo = StreamInfosByUrl[url];
-        if (!streamInfo) {
-            return textStr;
-        }
+    async function processM3U8(url, realFetch, streamInfo, request) {
+        let textStr = request.original;
         if (HasTriggeredPlayerReload) {
             HasTriggeredPlayerReload = false;
             streamInfo.LastPlayerReload = Date.now();
         }
-        const haveAdTags = textStr.includes(AdSignifier) || SimulatedAdsDepth > 0;
-        if (haveAdTags) {
+        if (request.hasAds) {
             const selectionStarted = Date.now();
             streamInfo.IsMidroll = textStr.includes('"MIDROLL"') || textStr.includes('"midroll"');
             if (!streamInfo.IsShowingAd) {
@@ -599,10 +636,6 @@ twitch-videoad.js text/javascript
                 }
             }
             const currentResolution = streamInfo.Urls[url];
-            if (!currentResolution) {
-                console.warn('[VAFT] original playlist returned: type=media reason=missing-resolution');
-                return textStr;
-            }
             const isHevc = currentResolution.Codecs.startsWith('hev') || currentResolution.Codecs.startsWith('hvc');
             if (((isHevc && !SkipPlayerReloadOnHevc) || AlwaysReloadPlayerOnAd) && streamInfo.ModifiedM3U8 && !streamInfo.IsUsingModifiedM3U8) {
                 streamInfo.IsUsingModifiedM3U8 = true;
@@ -614,13 +647,49 @@ twitch-videoad.js text/javascript
             let backup = null;
             let fallback = null;
             let profilesTried = 0;
+            const minPreferredBackupPixels = 1280 * 720;
             const searchController = new AbortController();
+            request.searchController = searchController;
             const { signal } = searchController;
             const searchTimer = setTimeout(() => searchController.abort(), BackupSearchBudgetMs);
             let upgradeTimer;
+            function keepCleanBackup(candidate) {
+                if (!backup && !candidate.variant.matchesCurrentQuality) {
+                    upgradeTimer = setTimeout(() => searchController.abort(), BackupUpgradeBudgetMs);
+                }
+                backup = candidate;
+            }
+            async function readBackupPlaylist(variant, requestSignal) {
+                const response = variant ? await realFetch(variant.url, { signal: requestSignal }) : null;
+                if (response?.status !== 200 || requestSignal.aborted) {
+                    return null;
+                }
+                const playlist = await response.text();
+                return requestSignal.aborted ? null : playlist;
+            }
             // During reloads, try each player type once before retrying on the next playlist request.
             const attemptsPerPlayer = streamInfo.LastPlayerReload > Date.now() - PlayerReloadMinimalRequestsTime ? 1 : 2;
             try {
+                const preferred = streamInfo.PreferredBackupProfile;
+                const cachedMaster = BackupPlayerTypes.indexOf(preferred) > 0 ? streamInfo.BackupEncodingsM3U8Cache[preferred] : null;
+                const preferredVariant = cachedMaster && SimulatedAdsDepth === 0 ? getStreamForResolution(cachedMaster, currentResolution) : null;
+                if (preferredVariant?.pixels >= minPreferredBackupPixels) {
+                    // Give the active HD stream one short cached probe before trying the ordinary fallback order.
+                    const probe = new AbortController();
+                    const abortProbe = () => probe.abort();
+                    const probeTimer = setTimeout(abortProbe, BackupUpgradeBudgetMs);
+                    signal.addEventListener('abort', abortProbe, { once: true });
+                    profilesTried++;
+                    try {
+                        const text = await readBackupPlaylist(preferredVariant, probe.signal);
+                        if (text && !text.includes(AdSignifier)) {
+                            keepCleanBackup({ playerType: preferred, variant: preferredVariant, text });
+                        }
+                    } catch (err) {} finally {
+                        signal.removeEventListener('abort', abortProbe);
+                        clearTimeout(probeTimer);
+                    }
+                }
                 for (let playerTypeIndex = 0; !signal.aborted && !backup?.variant.matchesCurrentQuality && playerTypeIndex < BackupPlayerTypes.length; playerTypeIndex++) {
                     profilesTried++;
                     const playerType = BackupPlayerTypes[playerTypeIndex];
@@ -634,42 +703,43 @@ twitch-videoad.js text/javascript
                             isFreshM3u8 = true;
                             try {
                                 const accessTokenResponse = await getAccessToken(streamInfo.ChannelName, realPlayerType, signal);
-                                if (accessTokenResponse.status === 200) {
+                                if (accessTokenResponse.status === 200 && !signal.aborted) {
                                     const accessToken = await accessTokenResponse.json();
+                                     if (signal.aborted) {
+                                         break;
+                                     }
                                     const urlInfo = new URL('https://usher.ttvnw.net/api/' + (V2API ? 'v2/' : '') + 'channel/hls/' + streamInfo.ChannelName + '.m3u8' + streamInfo.UsherParams);
                                     urlInfo.searchParams.set('sig', accessToken.data.streamPlaybackAccessToken.signature);
                                     urlInfo.searchParams.set('token', accessToken.data.streamPlaybackAccessToken.value);
                                     const encodingsM3u8Response = await realFetch(urlInfo.href, { signal });
                                     if (encodingsM3u8Response.status === 200) {
-                                        encodingsM3u8 = streamInfo.BackupEncodingsM3U8Cache[playerType] = await encodingsM3u8Response.text();
+                                        encodingsM3u8 = await encodingsM3u8Response.text();
+                                        if (signal.aborted) {
+                                            break;
+                                        }
+                                        streamInfo.BackupEncodingsM3U8Cache[playerType] = encodingsM3u8;
                                     }
                                 }
                             } catch (err) {}
                         }
-                        if (encodingsM3u8) {
+                        if (!signal.aborted && encodingsM3u8) {
                             try {
                                 const variant = getStreamForResolution(encodingsM3u8, currentResolution);
                                 if (variant && backup && compareStreamQuality(variant, backup.variant) <= 0) {
                                     break;
                                 }
-                                const streamM3u8Response = variant ? await realFetch(variant.url, { signal }) : null;
-                                if (streamM3u8Response?.status === 200) {
-                                    const m3u8Text = await streamM3u8Response.text();
-                                    if (m3u8Text) {
-                                        const candidate = { playerType, variant, text: m3u8Text };
-                                        if (!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) {
-                                            if (!backup && !variant.matchesCurrentQuality) {
-                                                upgradeTimer = setTimeout(() => searchController.abort(), BackupUpgradeBudgetMs);
-                                            }
-                                            backup = candidate;
-                                            break;
-                                        }
-                                        if (playerType === FallbackPlayerType || (!fallback && playerTypeIndex === BackupPlayerTypes.length - 1)) {
-                                            fallback = candidate;
-                                        }
-                                        if (isFullyCachedPlayerType) {
-                                            break;
-                                        }
+                                const m3u8Text = await readBackupPlaylist(variant, signal);
+                                if (m3u8Text) {
+                                    const candidate = { playerType, variant, text: m3u8Text };
+                                    if (!m3u8Text.includes(AdSignifier) && (SimulatedAdsDepth == 0 || playerTypeIndex >= SimulatedAdsDepth - 1)) {
+                                        keepCleanBackup(candidate);
+                                        break;
+                                    }
+                                    if (playerType === FallbackPlayerType || (!fallback && playerTypeIndex === BackupPlayerTypes.length - 1)) {
+                                        fallback = candidate;
+                                    }
+                                    if (isFullyCachedPlayerType) {
+                                        break;
                                     }
                                 }
                             } catch (err) {}
@@ -686,8 +756,14 @@ twitch-videoad.js text/javascript
             } finally {
                 clearTimeout(searchTimer);
                 clearTimeout(upgradeTimer);
+                request.searchController = null;
             }
+            if (streamInfo.LatestMediaRequest !== request || StreamInfos[streamInfo.ChannelName] !== streamInfo || StreamInfosByUrl[url] !== streamInfo) {
+                return request.original;
+            }
+            textStr = request.original;
             const selected = backup ?? fallback;
+            streamInfo.PreferredBackupProfile = backup?.variant.pixels >= minPreferredBackupPixels ? backup.playerType : null;
             streamInfo.LastBackupWindow = selected ? getAdResumeWindow(selected.text) : null;
             let label = 'original';
             if (selected) {
@@ -728,6 +804,7 @@ twitch-videoad.js text/javascript
             streamInfo.IsStrippingAdSegments = false;
             streamInfo.NumStrippedAdSegments = 0;
             streamInfo.ActiveBackupVariant = null;
+            streamInfo.PreferredBackupProfile = null;
             streamInfo.LastBackupWindow = null;
             streamInfo.IsUsingModifiedM3U8 = false;
             const resume = reloadReason ? `reload reason=${reloadReason}` : 'direct';
