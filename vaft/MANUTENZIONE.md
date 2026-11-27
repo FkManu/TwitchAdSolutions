@@ -44,7 +44,7 @@ Per ogni playlist master, `getStreamForResolution` considera le varianti entro r
    node --test vaft/test/playlist.test.cjs
    ```
 
-3. Apri una pull request verso `main` nella repository di VAFT Community. Il workflow `VAFT offline tests` esegue gli stessi controlli in GitHub Actions. Verifica anche l'iniezione e la riproduzione in un profilo browser di prova prima del merge.
+3. Apri una pull request verso `main` nella repository di Free Adv Twitch Script. Il workflow `VAFT offline tests` esegue gli stessi controlli in GitHub Actions. Verifica anche l'iniezione e la riproduzione in un profilo browser di prova prima del merge.
 4. Allinea `@version` e il valore di `vaftBuild` in entrambi i file. Dopo i controlli, crea manualmente una bozza di release GitHub per il tag corrispondente, per esempio `v37.0.1`, e verifica che punti al commit collaudato. Aggiungi alle note i link Raw fissati a quel commit per entrambi gli script. Lo userscript usa `@downloadURL none` per mantenere il passaggio alla versione successiva manuale. [Release di GitHub](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository)
 
 Il collaudo di questa patch è offline. La compatibilità con il player Twitch attuale richiede una verifica nel browser.

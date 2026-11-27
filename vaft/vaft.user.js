@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         TwitchAdSolutions (VAFT Community)
+// @name         Free Adv Twitch Script
 // @namespace    https://github.com/pixeltris/TwitchAdSolutions
 // @version      37.0.1
 // @description  Multiple solutions for blocking Twitch ads (vaft)

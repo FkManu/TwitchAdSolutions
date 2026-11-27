@@ -1,4 +1,4 @@
-# VAFT Community
+# Free Adv Twitch Script
 
 An independently maintained continuation of VAFT from [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), archived on March 5, 2026. The original work is by pixeltris and the TwitchAdSolutions contributors. See [LICENSE](LICENSE) for the MIT license and copyright notice.
 
