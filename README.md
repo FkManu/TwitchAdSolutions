@@ -1,6 +1,6 @@
-# TwitchAdSolutions
+# VAFT Community
 
-This community fork maintains VAFT. The [original project](https://github.com/pixeltris/TwitchAdSolutions) was archived on March 5, 2026. See [LICENSE](LICENSE) for the original MIT license and attribution.
+An independently maintained continuation of VAFT from [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions), archived on March 5, 2026. The original work is by pixeltris and the TwitchAdSolutions contributors. See [LICENSE](LICENSE) for the MIT license and copyright notice.
 
 **Don't combine Twitch specific ad blockers.**
 
